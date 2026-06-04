@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,7 +10,9 @@ import pytest
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.subagent import SubagentManager, SubagentStatus
+from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.filesystem import FileToolsConfig
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ToolsConfig
 from nanobot.llm_usage.context import llm_usage_source
@@ -21,6 +24,26 @@ from nanobot.utils.llm_runtime import LLMRuntime
 def _runtime(provider: LLMProvider) -> LLMRuntime:
     provider.generation = GenerationSettings()
     return LLMRuntime.capture(provider, "test", context_window_tokens=128_000)
+
+
+class _FakeTool(Tool):
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return "fake tool"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **_kwargs: Any) -> str:
+        return "ok"
 
 
 @pytest.mark.asyncio
@@ -172,6 +195,44 @@ async def test_subagent_keeps_project_runtime_scope_with_agent_owned_tools(tmp_p
     spec = manager.runner.run.call_args.args[0]
     assert spec.workspace == project
     assert spec.tools.get("read_file")._workspace == agent_workspace.resolve()
+
+
+def test_subagent_does_not_inherit_parent_mcp_tools_by_default(tmp_path):
+    """Subagents keep MCP access disabled unless explicitly configured."""
+    parent_tools = ToolRegistry()
+    parent_tools.register(_FakeTool("mcp_test_demo"))
+    sm = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+        consolidator=MagicMock(spec=Consolidator),
+        parent_tools=parent_tools,
+    )
+
+    tools = sm._build_tools()
+
+    assert not tools.has("mcp_test_demo")
+
+
+def test_subagent_inherits_only_parent_mcp_tools_when_enabled(tmp_path):
+    """The opt-in shares connected MCP wrappers without copying non-MCP parent tools."""
+    parent_tools = ToolRegistry()
+    mcp_tool = _FakeTool("mcp_test_demo")
+    parent_tools.register(mcp_tool)
+    parent_tools.register(_FakeTool("parent_only"))
+    sm = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+        tools_config=ToolsConfig(subagent_mcp_access=True),
+        consolidator=MagicMock(spec=Consolidator),
+        parent_tools=parent_tools,
+    )
+
+    tools = sm._build_tools()
+
+    assert tools.get("mcp_test_demo") is mcp_tool
+    assert not tools.has("parent_only")
 
 
 @pytest.mark.asyncio
