@@ -98,6 +98,7 @@ class SubagentManager:
         max_tool_result_chars: int | None = None,
         model: str | None = None,
         tools_config: ToolsConfig | None = None,
+        parent_tools: ToolRegistry | None = None,
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
@@ -133,6 +134,7 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.tools_config = tools_config or ToolsConfig()
+        self.parent_tools = parent_tools
         self.max_tool_result_chars = max_tool_result_chars
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
@@ -203,8 +205,20 @@ class SubagentManager:
             exec=self.tools_config.exec,
             web=self.tools_config.web,
             file=self.tools_config.file,
+            subagent_mcp_access=self.tools_config.subagent_mcp_access,
             restrict_to_workspace=self.restrict_to_workspace,
         )
+
+    def _register_parent_mcp_tools(self, registry: ToolRegistry, cfg: ToolsConfig) -> None:
+        """Share already-connected MCP wrappers with an isolated subagent registry."""
+        if not cfg.subagent_mcp_access or self.parent_tools is None:
+            return
+        for name in self.parent_tools.tool_names:
+            if not name.startswith("mcp_"):
+                continue
+            tool = self.parent_tools.get(name)
+            if tool is not None:
+                registry.register(tool)
 
     def _build_tools(
         self,
@@ -226,6 +240,7 @@ class SubagentManager:
             ),
         )
         ToolLoader().load(ctx, registry, scope="subagent")
+        self._register_parent_mcp_tools(registry, cfg)
         return registry
 
     async def spawn(

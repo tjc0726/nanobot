@@ -3,10 +3,12 @@
 import asyncio
 import time
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.agent.tools.base import Tool
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import GenerationSettings
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -17,6 +19,26 @@ _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 def _runtime(provider: MagicMock, model: str = "test-model") -> LLMRuntime:
     provider.generation = GenerationSettings(temperature=0.1, max_tokens=4096)
     return LLMRuntime.capture(provider, model, context_window_tokens=128_000)
+
+
+class _FakeTool(Tool):
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return "fake tool"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **_kwargs: Any) -> str:
+        return "ok"
 
 
 @pytest.mark.asyncio
@@ -426,6 +448,33 @@ def test_agent_loop_passes_max_iterations_to_subagents(tmp_path):
     )
 
     assert loop.subagents.max_iterations == 42
+
+
+def test_agent_loop_wires_parent_tools_for_subagent_mcp_access(tmp_path):
+    """AgentLoop should let subagents inherit only live MCP tools when configured."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.schema import ToolsConfig
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mcp_tool = _FakeTool("mcp_test_demo")
+
+    loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        tools_config=ToolsConfig(subagent_mcp_access=True),
+    )
+    loop.tools.register(mcp_tool)
+    loop.tools.register(_FakeTool("parent_only"))
+
+    tools = loop.subagents._build_tools()
+
+    assert tools.get("mcp_test_demo") is mcp_tool
+    assert not tools.has("parent_only")
 
 
 @pytest.mark.asyncio
