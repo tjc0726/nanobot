@@ -10,13 +10,19 @@ import os
 import time
 import weakref
 from collections.abc import Coroutine, Iterable, Mapping
-from contextlib import AbstractContextManager, ExitStack, nullcontext, suppress
+from contextlib import (
+    AbstractContextManager,
+    ExitStack,
+    asynccontextmanager,
+    nullcontext,
+    suppress,
+)
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, TypeVar, cast
 
 from loguru import logger
 
@@ -1636,6 +1642,67 @@ class AgentLoop:
             ):
                 recovery_admission.unregister_recovery_task(session_key, current_task)
 
+    @asynccontextmanager
+    async def _active_pending_queue(
+        self,
+        session_key: str,
+    ) -> AsyncGenerator[asyncio.Queue[InboundMessage] | None, None]:
+        """Publish a session inbox while a direct turn owns its session lock.
+
+        Direct turns (cron, dream, API) do not run through the session worker, so
+        they install a temporary inbox that lets subagent results and follow-ups
+        be injected mid-turn.  When a session worker already owns the inbox, the
+        direct turn leaves it alone: the worker keeps FIFO ownership and handles
+        those messages after the direct turn releases the session lock.
+        """
+        if session_key in self._pending_queues:
+            yield None
+            return
+        pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
+        self._pending_queues[session_key] = pending
+        try:
+            yield pending
+        finally:
+            # Only remove our own inbox; a later task waiting on the lock must
+            # not be able to steal cleanup ownership.
+            owns_queue = self._pending_queues.get(session_key) is pending
+            if owns_queue:
+                self._pending_queues.pop(session_key, None)
+            leftover = 0
+            while True:
+                try:
+                    item = pending.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                await self.bus.publish_inbound(item)
+                leftover += 1
+            if leftover:
+                logger.info(
+                    "Re-published {} leftover message(s) to bus for session {}",
+                    leftover,
+                    session_key,
+                )
+            if owns_queue:
+                # Automation turns deferred while this direct turn owned the
+                # inbox have no session worker to drain them, so release one
+                # now that the inbox is gone.
+                await self._publish_next_deferred_automation_turn(session_key)
+
+    async def _publish_next_deferred_automation_turn(self, session_key: str) -> None:
+        """Release a deferred automation turn after a direct turn frees its session.
+
+        Session workers drain deferred turns inline; direct turns have no worker,
+        so route the next deferred turn back through the bus instead of leaving
+        it stranded.
+        """
+        deferred = self._deferred_automation_turns.get(session_key)
+        if not deferred:
+            return
+        msg = deferred.pop(0)
+        if not deferred:
+            self._deferred_automation_turns.pop(session_key, None)
+        await self.bus.publish_inbound(msg)
+
     async def aclose(self) -> None:
         """Stop active work, then close resources owned by the agent loop.
 
@@ -2530,31 +2597,33 @@ class AgentLoop:
         lock = self._get_session_lock(session_key)
         try:
             async with lock:
-                kwargs: dict[str, Any] = {
-                    "session_key": session_key,
-                    "on_progress": on_progress,
-                    "on_stream": on_stream,
-                    "on_stream_end": on_stream_end,
-                    "ephemeral": ephemeral,
-                }
-                if _run_extra_hooks_for_ephemeral:
-                    kwargs["run_extra_hooks_for_ephemeral"] = True
-                if hooks is not None:
-                    kwargs["hooks"] = hooks
-                if hook_factories is not None:
-                    kwargs["hook_factories"] = hook_factories
-                if tools is not None:
-                    kwargs["tools"] = tools
-                if runtime is not None:
-                    kwargs["runtime"] = runtime
-                if on_runtime_admitted is not None:
-                    kwargs["on_runtime_admitted"] = on_runtime_admitted
-                if attributes is not None:
-                    kwargs["attributes"] = dict(attributes)
-                return await self._process_message(
-                    msg,
-                    **kwargs,
-                )
+                async with self._active_pending_queue(session_key) as pending:
+                    kwargs: dict[str, Any] = {
+                        "session_key": session_key,
+                        "on_progress": on_progress,
+                        "on_stream": on_stream,
+                        "on_stream_end": on_stream_end,
+                        "ephemeral": ephemeral,
+                        "pending_queue": pending,
+                    }
+                    if _run_extra_hooks_for_ephemeral:
+                        kwargs["run_extra_hooks_for_ephemeral"] = True
+                    if hooks is not None:
+                        kwargs["hooks"] = hooks
+                    if hook_factories is not None:
+                        kwargs["hook_factories"] = hook_factories
+                    if tools is not None:
+                        kwargs["tools"] = tools
+                    if runtime is not None:
+                        kwargs["runtime"] = runtime
+                    if on_runtime_admitted is not None:
+                        kwargs["on_runtime_admitted"] = on_runtime_admitted
+                    if attributes is not None:
+                        kwargs["attributes"] = dict(attributes)
+                    return await self._process_message(
+                        msg,
+                        **kwargs,
+                    )
         finally:
             await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")
             self.runtime_event_publisher.clear_turn(session_key)
